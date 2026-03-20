@@ -1,15 +1,4 @@
-'''
 
-Что делает эта версия:
-
-✔ параллельно обрабатывает архивы (WORKERS = 10), но не книги внутри архива
-✔ использует ProcessPoolExecutor
-✔ безопасна (архив пишется только после завершения обработки)
-✔ использует .library_state.json
-✔ не перезаписывает готовые архивы
-✔ показывает общий прогресс
-✔ корректно переживает остановку скрипта
-'''
 
 import os
 import zipfile
@@ -23,31 +12,31 @@ WORKERS = 10
 
 
 def format_time(sec):
-
     sec = int(sec)
-    h = sec // 3600
-    m = (sec % 3600) // 60
-    s = sec % 60
-
-    return f"{h:02}:{m:02}:{s:02}"
+    return f"{sec//3600:02}:{(sec%3600)//60:02}:{sec%60:02}"
 
 
 def is_russian(text):
-
     t = text.lower()
-
     if "<lang>ru" in t:
         return True
-
     if "<lang>" in t:
         return False
-
     return True
+
+
+def is_valid_zip(path):
+    try:
+        with zipfile.ZipFile(path) as z:
+            return z.testzip() is None
+    except:
+        return False
 
 
 def process_archive(task):
 
     src, dst = task
+    tmp = dst + ".tmp"
 
     books = 0
     removed = 0
@@ -59,7 +48,7 @@ def process_archive(task):
 
         with zipfile.ZipFile(src) as zin:
 
-            with zipfile.ZipFile(dst, "w", compression=zipfile.ZIP_DEFLATED) as zout:
+            with zipfile.ZipFile(tmp, "w", compression=zipfile.ZIP_DEFLATED) as zout:
 
                 for item in zin.infolist():
 
@@ -87,7 +76,16 @@ def process_archive(task):
                     except Exception:
                         errors += 1
 
+        # атомарная замена
+        os.replace(tmp, dst)
+
     except Exception as e:
+
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except:
+                pass
 
         return {
             "archive": os.path.basename(src),
@@ -110,7 +108,6 @@ def load_state(folder):
     path = os.path.join(folder, STATE_FILE)
 
     if not os.path.exists(path):
-
         return {
             "archives": {},
             "total_books": 0,
@@ -125,13 +122,42 @@ def load_state(folder):
 def save_state(folder, state):
 
     path = os.path.join(folder, STATE_FILE)
-
     tmp = path + ".tmp"
 
     with open(tmp, "w", encoding="utf8") as f:
         json.dump(state, f, indent=2)
 
     os.replace(tmp, path)
+
+
+def cleanup_tmp(folder):
+
+    for f in os.listdir(folder):
+        if f.endswith(".tmp"):
+            path = os.path.join(folder, f)
+            print("🧹 удаляю tmp:", f)
+            try:
+                os.remove(path)
+            except:
+                pass
+
+
+def validate_existing_archives(folder, state):
+
+    broken = []
+
+    for name in list(state["archives"].keys()):
+
+        path = os.path.join(folder, name)
+
+        if not os.path.exists(path) or not is_valid_zip(path):
+            print("⚠ поврежден архив, будет пересобран:", name)
+            broken.append(name)
+
+    for name in broken:
+        del state["archives"][name]
+
+    return state
 
 
 def main():
@@ -141,32 +167,27 @@ def main():
 
     os.makedirs(dst_dir, exist_ok=True)
 
+    cleanup_tmp(dst_dir)
+
     state = load_state(dst_dir)
+    state = validate_existing_archives(dst_dir, state)
 
     processed = set(state["archives"].keys())
 
     archives = sorted(f for f in os.listdir(src_dir) if f.endswith(".zip"))
-
     todo = [a for a in archives if a not in processed]
 
-    print()
-    print("CPU workers:", WORKERS)
+    print("\nCPU workers:", WORKERS)
     print("Всего архивов:", len(archives))
-    print("Уже обработано:", len(processed))
-    print("Осталось:", len(todo))
-    print()
+    print("Готово:", len(processed))
+    print("Осталось:", len(todo), "\n")
 
-    tasks = []
-
-    for name in todo:
-
-        src = os.path.join(src_dir, name)
-        dst = os.path.join(dst_dir, name)
-
-        tasks.append((src, dst))
+    tasks = [
+        (os.path.join(src_dir, a), os.path.join(dst_dir, a))
+        for a in todo
+    ]
 
     start_all = time.time()
-
     done = 0
 
     with ProcessPoolExecutor(max_workers=WORKERS) as pool:
@@ -176,13 +197,10 @@ def main():
         for f in as_completed(futures):
 
             res = f.result()
-
             done += 1
 
             if "error" in res:
-
-                print(f"[{done}/{len(tasks)}] ❌ {res['archive']} error")
-
+                print(f"[{done}/{len(tasks)}] ❌ {res['archive']}")
                 continue
 
             name = res["archive"]
@@ -208,13 +226,11 @@ def main():
     total_time = time.time() - start_all
 
     print("\n===== ИТОГ =====")
-
-    print("Просмотрено книг:", state["total_books"])
-    print("Удалено нерусских:", state["total_removed"])
-    print("Ошибок чтения:", state["total_errors"])
-    print("Русских книг:", state["total_books"] - state["total_removed"])
-
-    print("Общее время:", format_time(total_time))
+    print("Всего книг:", state["total_books"])
+    print("Удалено:", state["total_removed"])
+    print("Ошибки:", state["total_errors"])
+    print("Русских:", state["total_books"] - state["total_removed"])
+    print("Время:", format_time(total_time))
 
 
 if __name__ == "__main__":
