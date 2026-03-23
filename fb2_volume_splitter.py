@@ -1,8 +1,5 @@
 '''
-✅ та версия скрипта:
-
-
-Полностью сохраняет весь предыдущий функционал:
+✅ Полностью сохраняет весь предыдущий функционал:
 → GUI, прогресс-бар, логи, выбор папок, безопасная запись через .tmp.
 
 Добавляет критически важную новую возможность:
@@ -30,7 +27,7 @@
 
 Выбирается папка с ZIP-архивами, содержащими .fb2 файлы.
 Программа подсчитывает количество FB2-файлов.
-Затем она распаковывает и перезаписывает эти файлы в новые архивы-тома по 10 ГБ.
+Затем она распаковывает и перезаписывает эти файлы в новые архивы-тома по MAX_VOLUME_SIZE ГБ.
 Каждый том получает имя по шаблону ГГГГММДДЧЧММ.zip.
 Используется .tmp во время записи — это защита от повреждения при аварийной остановке.
 GUI обновляется через очередь, чтобы не блокировать основной поток.
@@ -54,10 +51,10 @@ import sqlite3             # Лёгкая БД для состояния
 # Максимальный размер одного тома (10 ГБ)
 MAX_VOLUME_SIZE = 10 * 1024 * 1024 * 1024  # можно изменить на 4 или 5 ГБ
 
-# Глобальный флаг остановки
+# Глобальный флаг остановки — сигнализирует потоку завершить работу
 STOP_FLAG = False
 
-# Файл состояния
+# Имя файла базы данных для хранения состояния обработки
 STATE_DB = "splitter_state.db"
 
 
@@ -71,16 +68,17 @@ def init_db(db_path):
     with sqlite3.connect(db_path) as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS processed_files (
-                archive_name TEXT NOT NULL,
-                fb2_path     TEXT NOT NULL,
-                PRIMARY KEY (archive_name, fb2_path)
+                archive_name TEXT NOT NULL,  -- имя исходного ZIP-архива
+                fb2_path     TEXT NOT NULL,  -- путь к файлу .fb2 внутри архива
+                PRIMARY KEY (archive_name, fb2_path)  -- уникальность пары
             )
         """)
+        # Индекс для ускорения поиска по архиву
         conn.execute("CREATE INDEX IF NOT EXISTS idx_archive ON processed_files(archive_name)")
 
 
 def mark_processed(db_path, archive_name, fb2_path):
-    """Отмечает файл как обработанный"""
+    """Отмечает файл как обработанный, игнорируя дубликаты"""
     try:
         with sqlite3.connect(db_path) as conn:
             conn.execute(
@@ -92,7 +90,14 @@ def mark_processed(db_path, archive_name, fb2_path):
 
 
 def new_volume(out_dir):
-    """Создаёт новый том с временным именем .tmp"""
+    """
+    Создаёт новый том с временным именем .tmp.
+    Возвращает:
+        - объект ZipFile
+        - имя .tmp файла (временный)
+        - финальное имя (без .tmp)
+        - текущий размер тома (0)
+    """
     timestamp = datetime.now().strftime("%Y%m%d%H%M")
     name = f"{timestamp}.zip"
     tmp_name = name + ".tmp"
@@ -105,14 +110,14 @@ def new_volume(out_dir):
 def worker(src_dir, out_dir, ui_q):
     """
     Основной обработчик. Работает в фоне.
-    Распределяет .fb2 по томам по 10 ГБ с возможностью возобновления.
+    Распределяет .fb2 по томам по MAX_VOLUME_SIZE ГБ с возможностью возобновления.
     """
     global STOP_FLAG
 
     db_path = os.path.join(out_dir, STATE_DB)
     init_db(db_path)
 
-    # Получаем список архивов
+    # Получаем список всех ZIP-архивов в исходной директории
     archives = [
         os.path.join(src_dir, f)
         for f in os.listdir(src_dir)
@@ -124,7 +129,7 @@ def worker(src_dir, out_dir, ui_q):
         ui_q.put(("done",))
         return
 
-    # Подсчёт уже обработанных файлов
+    # Подсчёт уже обработанных файлов из БД
     try:
         with sqlite3.connect(db_path) as conn:
             cursor = conn.cursor()
@@ -136,7 +141,7 @@ def worker(src_dir, out_dir, ui_q):
 
     ui_q.put(("log", f"✅ Загружено состояние: {seen_count} файлов уже обработано"))
 
-    # Сбор новых файлов
+    # Сбор новых файлов (не обработанных ранее)
     all_fb2_items = []
     total_new = 0
 
@@ -150,12 +155,13 @@ def worker(src_dir, out_dir, ui_q):
                 for item in zin.infolist():
                     if item.filename.endswith(".fb2"):
                         key = (os.path.basename(archive), item.filename)
+                        # Проверяем, был ли этот файл уже обработан
                         cursor.execute(
                             "SELECT 1 FROM processed_files WHERE archive_name = ? AND fb2_path = ?",
                             key
                         )
                         if cursor.fetchone():
-                            continue  # уже обработан
+                            continue  # уже обработан — пропускаем
                         all_fb2_items.append((archive, item))
                         total_new += 1
         except Exception as e:
@@ -175,7 +181,7 @@ def worker(src_dir, out_dir, ui_q):
     # Открываем первый том
     zout, tmp_name, final_name, vol_size = new_volume(out_dir)
 
-    # Обработка
+    # Обработка всех найденных .fb2 файлов
     with sqlite3.connect(db_path) as conn:
         cursor = conn.cursor()
 
@@ -192,120 +198,24 @@ def worker(src_dir, out_dir, ui_q):
 
             size = len(data)
 
+            # Если текущий том переполнится — закрываем его и создаём новый
             if vol_size + size > MAX_VOLUME_SIZE:
                 zout.close()
                 tmp_path = os.path.join(out_dir, tmp_name)
                 final_path = os.path.join(out_dir, final_name)
-                os.replace(tmp_path, final_path)  # атомарно
+                os.replace(tmp_path, final_path)  # атомарно переименовываем .tmp → .zip
                 ui_q.put(("log", f"📦 Том готов: {final_name}"))
 
                 zout, tmp_name, final_name, vol_size = new_volume(out_dir)
 
+            # Записываем файл в текущий том
             zout.writestr(item.filename, data)
             vol_size += size
             processed_books += 1
 
-            # Сохраняем факт обработки
+            # Сохраняем факт успешной обработки
             mark_processed(db_path, os.path.basename(archive_path), item.filename)
 
             now = time.time()
             if now - last_ui > 3:
                 elapsed = now - start
-                speed = (processed_books - seen_count) / elapsed if elapsed > 0 else 0
-                ui_q.put(("progress", processed_books, processed_books, speed))
-                last_ui = now
-
-    # Закрытие последнего тома
-    try:
-        zout.close()
-        tmp_path = os.path.join(out_dir, tmp_name)
-        final_path = os.path.join(out_dir, final_name)
-        os.replace(tmp_path, final_path)
-        ui_q.put(("log", f"📦 Последний том сохранён: {final_name}"))
-    except Exception as e:
-        ui_q.put(("log", f"❌ Ошибка при закрытии тома: {e}"))
-
-    ui_q.put(("done",))
-
-
-class App:
-    def __init__(self, root):
-        self.root = root
-        self.q = queue.Queue()
-        root.title("FB2 Splitter v3.0 🔄")
-        root.geometry("650x450")
-
-        self.src = tk.Entry(root, width=80)
-        self.src.pack()
-        tk.Button(root, text="📂 Каталог архивов", command=self.pick_src).pack()
-
-        self.out = tk.Entry(root, width=80)
-        self.out.pack()
-        tk.Button(root, text="📁 Куда сохранять", command=self.pick_out).pack()
-
-        self.pb = ttk.Progressbar(root, length=600)
-        self.pb.pack(pady=10)
-
-        self.label = tk.Label(root, text="Ожидание...")
-        self.label.pack()
-
-        self.log = tk.Text(root, height=10)
-        self.log.pack(fill="both", expand=True)
-
-        tk.Button(root, text="▶️ Старт", command=self.start).pack()
-        tk.Button(root, text="⏹️ Стоп", command=self.stop).pack()
-
-        self.update()
-
-    def pick_src(self):
-        path = filedialog.askdirectory()
-        if path:
-            self.src.delete(0, tk.END)
-            self.src.insert(0, path)
-
-    def pick_out(self):
-        path = filedialog.askdirectory()
-        if path:
-            self.out.delete(0, tk.END)
-            self.out.insert(0, path)
-
-    def start(self):
-        global STOP_FLAG
-        STOP_FLAG = False
-
-        src = self.src.get().strip()
-        out = self.out.get().strip()
-
-        if not src or not os.path.isdir(src):
-            self.q.put(("log", "❌ Исходный каталог не существует"))
-            return
-        if not out or not os.path.isdir(out):
-            self.q.put(("log", "❌ Выходной каталог не существует"))
-            return
-
-        threading.Thread(target=worker, args=(src, out, self.q), daemon=True).start()
-
-    def stop(self):
-        global STOP_FLAG
-        STOP_FLAG = True
-        self.q.put(("log", "🛑 Остановка..."))
-
-    def update(self):
-        while not self.q.empty():
-            msg = self.q.get()
-            if msg[0] == "progress":
-                _, done, total, speed = msg
-                self.label.config(text=f"📖 {done:,} | ⏱️ {speed:.0f}/с")
-                self.pb["value"] = 100  # т.к. total = done (мы не знаем общее заранее)
-            elif msg[0] == "log":
-                self.log.insert(tk.END, msg[1] + "\n")
-                self.log.see(tk.END)
-            elif msg[0] == "done":
-                self.label.config(text="✅ ГОТОВО")
-        self.root.after(300, self.update)
-
-
-if __name__ == "__main__":
-    root = tk.Tk()
-    App(root)
-    root.mainloop()
